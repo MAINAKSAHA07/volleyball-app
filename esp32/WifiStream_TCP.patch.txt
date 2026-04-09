@@ -1,0 +1,48 @@
+This patch shows the minimal changes to your ESP32 sketch to stream live CSV over Wi‑Fi using a TCP server (newline-delimited).
+
+Add near the top (after WiFi includes):
+
+```cpp
+WiFiServer streamServer(3333);
+WiFiClient streamClient;
+```
+
+In `setup()` after WiFi connected (and AFTER RTC sync if you want), start the server and print IP:
+
+```cpp
+streamServer.begin();
+streamServer.setNoDelay(true);
+Serial.print("TCP stream server listening on ");
+Serial.print(WiFi.localIP());
+Serial.println(":3333");
+```
+
+IMPORTANT: remove/comment these lines so Wi‑Fi stays on:
+
+```cpp
+// WiFi.disconnect(true);
+// WiFi.mode(WIFI_OFF);
+```
+
+In `loop()` before logging (or right after building `dataMessage`), accept a client and stream:
+
+```cpp
+// Accept client if none connected
+if (!streamClient || !streamClient.connected()) {
+  streamClient = streamServer.available();
+  if (streamClient) {
+    streamClient.setNoDelay(true);
+    Serial.println("TCP client connected");
+    // Optional header
+    streamClient.print("epoch_ms,fsr1,fsr2,fsr3,fsr4,fsr5,fsr6\\n");
+  }
+}
+
+// After you create `dataMessage` (currently ends with \\r\\n), also stream it:
+if (streamClient && streamClient.connected()) {
+  streamClient.print(dataMessage); // already includes CRLF
+}
+```
+
+That’s it: each device will now stream the same CSV lines to any TCP client on port 3333.
+
