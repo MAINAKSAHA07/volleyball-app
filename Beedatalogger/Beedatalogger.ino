@@ -40,6 +40,7 @@ void writeFile(fs::FS &fs, const char * path, const char * message);
 void appendFile(fs::FS &fs, const char * path, const char * message);
 void flushBuffer();
 bool syncRTCFromNTP();
+void showBootIndicator();
 
 void setup() {
   Serial.begin(115200);
@@ -48,6 +49,7 @@ void setup() {
   // Initialize BDL (NeoPixel, battery functions, etc.)
   bdl.begin();
   bdl.setPixelBrightness(255 / 3);
+  showBootIndicator();
 
   // Initialize RTC
   if (!rtc.begin()) {
@@ -91,7 +93,7 @@ void setup() {
   File file = SD.open("/test.txt");
   if(!file) {
     Serial.println("Creating file...");
-    writeFile(SD, "/test.txt", "Epoch_ms,FSR-1,FSR-2,FSR-3,FSR-4,FSR-5,FSR-6\r\n");
+    writeFile(SD, "/test.txt", "Epoch_ms,FSR-1,FSR-2,FSR-3,FSR-4,FSR-5\r\n");
   }
   file.close();
 }
@@ -125,11 +127,10 @@ void loop() {
     int pin3v = analogRead(5);
     int pin4v = analogRead(6);
     int pin5v = analogRead(7);
-    int pin6v = analogRead(8);
 
     String dataMessage = String(epoch_ms) + "," +
                          String(pin1v) + "," + String(pin2v) + "," + String(pin3v) + "," +
-                         String(pin4v) + "," + String(pin5v) + "," + String(pin6v) + "\r\n";
+                         String(pin4v) + "," + String(pin5v) + "\r\n";
 
     logBuffer[bufferIndex++] = dataMessage;
 
@@ -262,4 +263,15 @@ bool syncRTCFromNTP() {
   Serial.println(dt.second());
 
   return true;
+}
+
+// Brief LED indicator so it’s obvious the board powered on.
+// Uses existing named colors from the BDL library (no custom RGB dependency).
+void showBootIndicator() {
+  for (int i = 0; i < 3; i++) {
+    bdl.setPixelColor(orange);
+    delay(120);
+    bdl.setPixelColor(off);
+    delay(80);
+  }
 }

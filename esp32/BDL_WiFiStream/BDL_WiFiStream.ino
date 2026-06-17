@@ -84,7 +84,7 @@ static void acceptClientIfNeeded() {
   streamClient.setNoDelay(true);
   streamClient.setTimeout(50);
   Serial.println("TCP client connected (CSV stream)");
-  streamClient.print("epoch_ms,fsr1,fsr2,fsr3,fsr4,fsr5,fsr6\n");
+  streamClient.print("epoch_ms,fsr1,fsr2,fsr3,fsr4,fsr5\n");
 }
 
 void setup() {
@@ -190,14 +190,13 @@ void loop() {
     int fsr3 = analogRead(5);
     int fsr4 = analogRead(6);
     int fsr5 = analogRead(7);
-    int fsr6 = analogRead(8);
 
     // Format CSV line into fixed buffer
     char line[128];
     int n = snprintf(
       line, sizeof(line),
       "%llu,%d,%d,%d,%d,%d,%d\r\n",
-      (unsigned long long)epoch_ms, fsr1, fsr2, fsr3, fsr4, fsr5, fsr6
+      (unsigned long long)epoch_ms, fsr1, fsr2, fsr3, fsr4, fsr5
     );
     if (n <= 0) continue;
 
@@ -264,7 +263,7 @@ void writeHeaderIfNeeded() {
   if (!file) {
     File wf = SD.open("/test.txt", FILE_WRITE);
     if (wf) {
-      wf.print("Epoch_ms,FSR-1,FSR-2,FSR-3,FSR-4,FSR-5,FSR-6\r\n");
+      wf.print("Epoch_ms,FSR-1,FSR-2,FSR-3,FSR-4,FSR-5\r\n");
       wf.close();
     }
     return;

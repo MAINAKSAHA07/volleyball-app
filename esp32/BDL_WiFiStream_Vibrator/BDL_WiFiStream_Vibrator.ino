@@ -60,6 +60,9 @@ constexpr uint32_t SD_EVERY_N = (SD_LOG_HZ == 0) ? 0 : (SAMPLE_HZ / SD_LOG_HZ); 
 constexpr size_t SD_BUF_BYTES = 8192;
 char sdBuf[SD_BUF_BYTES];
 size_t sdBufLen = 0;
+static File sdRecFile;
+static bool sdRecording = false;
+static char sdRecPath[80];
 
 unsigned long lastBatteryCheck = 0;
 #define BATTERY_CHECK_INTERVAL 1000
@@ -85,6 +88,9 @@ void updateStatusPixel();
 void pollStreamCommands();
 void updateVibrator();
 void triggerVibrateFromCommand(uint32_t pulseMs);
+uint64_t currentEpochMs();
+void startSdRecording(uint64_t epochMsStart);
+void stopSdRecording();
 
 /// Same mapping as Beedatalogger.ino: 3.00–4.20 V → 0–100 %.
 static int batteryPercentFromVolts(float v) {
@@ -106,6 +112,7 @@ static void acceptClientIfNeeded() {
 
   if (streamClient && !streamClient.connected()) {
     Serial.println("TCP: previous client no longer connected — pruning");
+    stopSdRecording(); // network breakage → stop SD session to match app lifecycle
     streamClient.stop();
     streamCmdBuf = "";
   }
@@ -115,6 +122,7 @@ static void acceptClientIfNeeded() {
 
   if (streamClient) {
     Serial.println("TCP: new client — closing previous socket");
+    stopSdRecording(); // new app session replaces old one; close SD file cleanly
     streamClient.stop();
     streamCmdBuf = "";
   }
@@ -124,7 +132,7 @@ static void acceptClientIfNeeded() {
   streamClient.setTimeout(50);
   streamCmdBuf = "";
   Serial.println("TCP client connected (CSV stream)");
-  streamClient.print("epoch_ms,fsr1,fsr2,fsr3,fsr4,fsr5,fsr6,battery_pct\n");
+  streamClient.print("epoch_ms,fsr1,fsr2,fsr3,fsr4,fsr5,battery_pct\n");
 }
 
 void setup() {
@@ -224,18 +232,7 @@ void loop() {
       updateVibrator();
     }
 
-    // Timestamp (device epoch_ms) — monotonic within each RTC second
-    DateTime now = rtc.now();
-    uint32_t rtcUnix = now.unixtime();
-    uint32_t msTick = millis();
-
-    if (!g_epochAnchorReady || rtcUnix != g_lastRtcUnix) {
-      g_lastRtcUnix = rtcUnix;
-      g_millisAtRtcSecondStart = msTick;
-      g_epochAnchorReady = true;
-    }
-    uint64_t epoch_ms = (uint64_t)rtcUnix * 1000ULL
-                        + (uint64_t)(msTick - g_millisAtRtcSecondStart);
+    uint64_t epoch_ms = currentEpochMs();
 
     // Read sensors
     int fsr1 = analogRead(3);
@@ -243,7 +240,6 @@ void loop() {
     int fsr3 = analogRead(5);
     int fsr4 = analogRead(6);
     int fsr5 = analogRead(7);
-    int fsr6 = analogRead(8);
 
     int batPct = batteryPercentFromVolts(bdl.getBatteryVoltage());
 
@@ -251,8 +247,8 @@ void loop() {
     char line[144];
     int n = snprintf(
       line, sizeof(line),
-      "%llu,%d,%d,%d,%d,%d,%d,%d\r\n",
-      (unsigned long long)epoch_ms, fsr1, fsr2, fsr3, fsr4, fsr5, fsr6, batPct
+      "%llu,%d,%d,%d,%d,%d,%d\r\n",
+      (unsigned long long)epoch_ms, fsr1, fsr2, fsr3, fsr4, fsr5, batPct
     );
     if (n <= 0) continue;
 
@@ -266,8 +262,8 @@ void loop() {
       }
     }
 
-    // SD logging (decimated)
-    if (SD_EVERY_N > 0 && (sampleCounter % SD_EVERY_N) == 0) {
+    // SD logging (decimated) — only when app explicitly starts a recording session.
+    if (sdRecording && SD_EVERY_N > 0 && (sampleCounter % SD_EVERY_N) == 0) {
       if (sdBufLen + (size_t)n < SD_BUF_BYTES) {
         memcpy(sdBuf + sdBufLen, line, (size_t)n);
         sdBufLen += (size_t)n;
@@ -317,6 +313,12 @@ void pollStreamCommands() {
           }
           triggerVibrateFromCommand(ms);
           Serial.println("VIBRATE command from app");
+        } else if (low == "rec start" || low == "record start") {
+          startSdRecording(currentEpochMs());
+          if (streamClient && streamClient.connected()) streamClient.print("OK REC START\n");
+        } else if (low == "rec stop" || low == "record stop" || low == "rec end") {
+          stopSdRecording();
+          if (streamClient && streamClient.connected()) streamClient.print("OK REC STOP\n");
         }
       }
       streamCmdBuf = "";
@@ -352,13 +354,11 @@ void updateVibrator() {
 void flushSdBuf() {
   if (sdBufLen == 0) return;
 
-  File f = SD.open("/test.txt", FILE_APPEND);
-  if (!f) {
+  if (!sdRecording || !sdRecFile) {
     sdBufLen = 0;
     return;
   }
-  f.write((const uint8_t*)sdBuf, sdBufLen);
-  f.close();
+  sdRecFile.write((const uint8_t*)sdBuf, sdBufLen);
   sdBufLen = 0;
 }
 
@@ -374,16 +374,7 @@ void initSDCard() {
 }
 
 void writeHeaderIfNeeded() {
-  File file = SD.open("/test.txt");
-  if (!file) {
-    File wf = SD.open("/test.txt", FILE_WRITE);
-    if (wf) {
-      wf.print("Epoch_ms,FSR-1,FSR-2,FSR-3,FSR-4,FSR-5,FSR-6\r\n");
-      wf.close();
-    }
-    return;
-  }
-  file.close();
+  // Legacy path (kept so existing code calling this compiles). Recording files now get headers on `REC START`.
 }
 
 bool syncRTCFromNTP() {
@@ -400,6 +391,59 @@ bool syncRTCFromNTP() {
   );
   rtc.adjust(dt);
   return true;
+}
+
+uint64_t currentEpochMs() {
+  // Timestamp (device epoch_ms) — monotonic within each RTC second
+  DateTime now = rtc.now();
+  uint32_t rtcUnix = now.unixtime();
+  uint32_t msTick = millis();
+
+  if (!g_epochAnchorReady || rtcUnix != g_lastRtcUnix) {
+    g_lastRtcUnix = rtcUnix;
+    g_millisAtRtcSecondStart = msTick;
+    g_epochAnchorReady = true;
+  }
+  return (uint64_t)rtcUnix * 1000ULL + (uint64_t)(msTick - g_millisAtRtcSecondStart);
+}
+
+void startSdRecording(uint64_t epochMsStart) {
+  if (!SD.begin()) {
+    Serial.println("SD not available — cannot start REC");
+    return;
+  }
+  if (sdRecording) {
+    // Close any previous session cleanly so each app session is a new file.
+    stopSdRecording();
+  }
+
+  // Keep base name stable; timestamp makes it unique. Include board id for multi-board captures.
+  // Example: /bdl-recording-1776161273000-bdl-01.csv
+  snprintf(sdRecPath, sizeof(sdRecPath), "/bdl-recording-%llu-%s.csv", (unsigned long long)epochMsStart, mdnsHost);
+
+  sdRecFile = SD.open(sdRecPath, FILE_WRITE);
+  if (!sdRecFile) {
+    Serial.println("Failed to open SD file for REC");
+    return;
+  }
+  sdRecFile.print("epoch_ms,fsr1,fsr2,fsr3,fsr4,fsr5,battery_pct\r\n");
+  sdRecFile.flush();
+  sdBufLen = 0;
+  sdRecording = true;
+  Serial.print("REC START -> ");
+  Serial.println(sdRecPath);
+}
+
+void stopSdRecording() {
+  if (!sdRecording) return;
+  flushSdBuf();
+  if (sdRecFile) {
+    sdRecFile.flush();
+    sdRecFile.close();
+  }
+  sdRecording = false;
+  sdBufLen = 0;
+  Serial.println("REC STOP");
 }
 
 /**
