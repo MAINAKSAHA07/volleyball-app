@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>This app uses Bluetooth to connect to Bee Data Logger (BDL) devices and stream real-time sensor data.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>This app uses Bluetooth to connect to Bee Data Logger (BDL) devices and stream real-time sensor data.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This app discovers Bee Data Logger devices on your local network (e.g. iPhone hotspot) and connects to them to stream real-time sensor data.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_bdl._tcp</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
+</dict>
+</plist>
