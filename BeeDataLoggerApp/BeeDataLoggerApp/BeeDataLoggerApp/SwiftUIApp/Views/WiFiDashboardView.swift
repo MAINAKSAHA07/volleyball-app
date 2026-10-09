@@ -128,7 +128,7 @@ struct WiFiDashboardView: View {
                 wifiVM.setActivePairIndex(pairIndex)
             } label: {
                 HStack(spacing: 8) {
-                    Text("Pair \(pairIndex + 1)")
+                    Text(wifiVM.pairDisplayName(pairIndex: pairIndex))
                         .font(.title3.weight(.semibold))
                         .foregroundStyle(.primary)
                     if isActive {
@@ -151,30 +151,26 @@ struct WiFiDashboardView: View {
             .buttonStyle(.plain)
             .disabled(wifiVM.isRecording)
 
-            pairPlayerNamesRow(pairIndex: pairIndex, aSlot: aSlot, bSlot: bSlot)
+            pairPlayerNamesRow(pairIndex: pairIndex)
 
             sleeveDeviceCard(slot: aSlot, pairIndex: pairIndex, label: "Sleeve A")
             sleeveDeviceCard(slot: bSlot, pairIndex: pairIndex, label: "Sleeve B")
         }
     }
 
-    private func pairPlayerNamesRow(pairIndex: Int, aSlot: Int, bSlot: Int) -> some View {
+    private func pairPlayerNamesRow(pairIndex: Int) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Players (Excel tab: \(wifiVM.pairSheetTitle(pairIndex: pairIndex)))")
+            Text("Person (Excel tab: \(wifiVM.pairSheetTitle(pairIndex: pairIndex)))")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            HStack(spacing: 10) {
-                TextField("Sleeve A player", text: Binding(
-                    get: { wifiVM.sleevePlayerName(slot: aSlot) },
-                    set: { wifiVM.setSleevePlayerName($0, slot: aSlot) }
-                ))
-                .textInputAutocapitalization(.words)
-                TextField("Sleeve B player", text: Binding(
-                    get: { wifiVM.sleevePlayerName(slot: bSlot) },
-                    set: { wifiVM.setSleevePlayerName($0, slot: bSlot) }
-                ))
-                .textInputAutocapitalization(.words)
-            }
+            TextField("Person name for this pair", text: Binding(
+                get: { wifiVM.pairName(pairIndex: pairIndex) },
+                set: { wifiVM.setPairName($0, pairIndex: pairIndex) }
+            ))
+            .textInputAutocapitalization(.words)
+            Text("Both Sleeve A and Sleeve B are worn by this person.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
         .padding(10)
         .background(Color(.tertiarySystemGroupedBackground))
@@ -184,7 +180,7 @@ struct WiFiDashboardView: View {
 
     @ViewBuilder
     private func sleeveDeviceCard(slot: Int, pairIndex: Int, label: String) -> some View {
-        let title = "Pair \(pairIndex + 1) — \(label)"
+        let title = "\(wifiVM.pairDisplayName(pairIndex: pairIndex)) — \(label)"
         if let device = wifiVM.device(atSlot: slot) {
             WiFiDeviceCardView(
                 title: title,
@@ -247,11 +243,11 @@ struct WiFiDashboardView: View {
                 set: { wifiVM.setActivePairIndex($0) }
             )) {
                 ForEach(0..<wifiVM.pairCount, id: \.self) { i in
-                    Text("Pair \(i + 1)").tag(i)
+                    Text(wifiVM.pairDisplayName(pairIndex: i)).tag(i)
                 }
             }
             .disabled(wifiVM.isRecording)
-            Text("After Stop, tap Save to export the workbook (.xls) or CSV. Each pair gets its own Excel tab. Charts use the active pair only.")
+            Text("After Stop, tap Save to export the workbook (.xls) or CSV. Each person/pair gets its own Excel tab. Analysis can page through every pair in a batch.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -336,7 +332,7 @@ struct WiFiDashboardView: View {
         let display = WiFiConnectViewModel.downsampleChartRows(rows, maxPoints: 320)
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("Session resultant (RMS ratio D1/D2)")
+                Text("Session resultant (RMS ratio Sleeve A/B)")
                     .font(.headline)
                 Spacer()
                 Button {
@@ -411,7 +407,7 @@ struct WiFiDashboardView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("Min resultant (each device)")
+                    Text("Min resultant (each sleeve)")
                         .font(.caption)
                     Spacer()
                     Text(String(format: "%.2f", wifiVM.autoVibrateMinResultant01))
@@ -422,7 +418,7 @@ struct WiFiDashboardView: View {
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Resultant ratio band (D1/D2)")
+                        Text("Resultant ratio band (Sleeve A / Sleeve B)")
                             .font(.caption)
                         Spacer()
                         Text(String(format: "%.2f…%.2f", wifiVM.autoVibrateRatioLower, wifiVM.autoVibrateRatioUpper))

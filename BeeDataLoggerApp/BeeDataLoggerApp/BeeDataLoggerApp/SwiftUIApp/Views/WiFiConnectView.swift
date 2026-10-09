@@ -25,24 +25,44 @@ struct WiFiConnectView: View {
                         set: { wifiVM.setActivePairIndex($0) }
                     )) {
                         ForEach(0..<wifiVM.pairCount, id: \.self) { i in
-                            Text("Pair \(i + 1)").tag(i)
+                            Text(wifiVM.pairDisplayName(pairIndex: i)).tag(i)
                         }
                     }
                     .disabled(wifiVM.isRecording)
                 }
 
                 Section("Auto-discovered (Bonjour)") {
+                    Text(wifiVM.discoveryStatusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
                     Group {
                         if wifiVM.discovered.isEmpty {
-                            Text("No devices found yet. Make sure both ESP32s advertise _bdl._tcp and your iPhone hotspot is on.")
-                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("No Bonjour devices yet.")
+                                    .foregroundStyle(.secondary)
+                                Text("On Mac: System Settings → Privacy & Security → Local Network → enable BeeDataLoggerApp. ESP32 boards must advertise _bdl._tcp on the same Wi‑Fi network.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text("A LAN port scan runs automatically after a few seconds if Bonjour finds nothing.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         } else {
                             ForEach(0..<wifiVM.pairCount, id: \.self) { pair in
                                 let aSlot = pair * 2
                                 let bSlot = aSlot + 1
                                 VStack(alignment: .leading, spacing: 8) {
-                                    Text("Pair \(pair + 1)")
+                                    Text(wifiVM.pairDisplayName(pairIndex: pair))
                                         .font(.subheadline.weight(.semibold))
+                                    TextField("Person name (this pair)", text: Binding(
+                                        get: { wifiVM.pairName(pairIndex: pair) },
+                                        set: { wifiVM.setPairName($0, pairIndex: pair) }
+                                    ))
+                                    .textInputAutocapitalization(.words)
+                                    Text("Both sleeves belong to this person.")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
                                     Picker("Sleeve A", selection: Binding(
                                         get: { wifiVM.slotSelectedKeys[aSlot] },
                                         set: { wifiVM.setSlotSelectedKey($0, slot: aSlot) }
@@ -61,16 +81,6 @@ struct WiFiConnectView: View {
                                             Text(d.name).tag(d.key)
                                         }
                                     }
-                                    TextField("Player A (Excel tab name)", text: Binding(
-                                        get: { wifiVM.sleevePlayerName(slot: aSlot) },
-                                        set: { wifiVM.setSleevePlayerName($0, slot: aSlot) }
-                                    ))
-                                    .textInputAutocapitalization(.words)
-                                    TextField("Player B (Excel tab name)", text: Binding(
-                                        get: { wifiVM.sleevePlayerName(slot: bSlot) },
-                                        set: { wifiVM.setSleevePlayerName($0, slot: bSlot) }
-                                    ))
-                                    .textInputAutocapitalization(.words)
                                 }
                                 .padding(.vertical, 4)
                             }
@@ -88,7 +98,7 @@ struct WiFiConnectView: View {
                             let aSlot = pair * 2
                             let bSlot = aSlot + 1
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("Pair \(pair + 1) (manual hosts)")
+                                Text("\(wifiVM.pairDisplayName(pairIndex: pair)) (manual hosts)")
                                     .font(.subheadline.weight(.semibold))
                                 TextField("Sleeve A host (optional, e.g. bdl-01.local)", text: Binding(
                                     get: { wifiVM.slotHosts[aSlot] },
@@ -113,7 +123,7 @@ struct WiFiConnectView: View {
 
                 Section("LAN Probe (port 3333)") {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Local IP: \(wifiVM.localIPv4.isEmpty ? "Unknown" : wifiVM.localIPv4)")
+                        Text("Interfaces: \(wifiVM.localIPv4.isEmpty ? "Unknown — tap Scan" : wifiVM.localIPv4)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
@@ -131,7 +141,7 @@ struct WiFiConnectView: View {
                     }
 
                     if !wifiVM.lanCandidates.isEmpty {
-                        Text("Assign to Pair \(wifiVM.activePairIndex + 1): A = Sleeve A, B = Sleeve B")
+                        Text("Assign to \(wifiVM.pairDisplayName(pairIndex: wifiVM.activePairIndex)): A = Sleeve A, B = Sleeve B")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                         Divider()

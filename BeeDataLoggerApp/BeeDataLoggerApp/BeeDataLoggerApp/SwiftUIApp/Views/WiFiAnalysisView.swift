@@ -206,13 +206,15 @@ struct WiFiAnalysisView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                analysisBatchControls
+
                 if !plotRows.isEmpty, displayRows.count < plotRows.count || displayRowsFsr.count < plotRows.count {
                     Text("Downsampled for rendering (Σ/resultant \(displayRows.count) pts, FSR charts \(displayRowsFsr.count) of \(plotRows.count)); markers use full indices.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
 
-                Text("Resultant is RMS ratio (D1/D2). Auto-vibrate triggers when ratio is within 0.8…1.2 and both pads exceed the minimum. Export (⋯) → CSV data or PNG image.")
+                Text("Resultant is RMS ratio (Sleeve A / Sleeve B). Auto-vibrate triggers when ratio is within 0.8…1.2 and both pads exceed the minimum. Export (⋯) → CSV data or PNG image.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
@@ -222,14 +224,78 @@ struct WiFiAnalysisView: View {
 
                 resultantChartCard
 
-                fsrChannelsCard(title: "Device 1 — FSR1…FSR5", reading: \.d1, exportBasename: "analysis-fsr-d1")
+                fsrChannelsCard(title: "Sleeve A — FSR1…FSR5", reading: \.d1, exportBasename: "analysis-fsr-sleeve-a")
 
-                fsrChannelsCard(title: "Device 2 — FSR1…FSR5", reading: \.d2, exportBasename: "analysis-fsr-d2")
+                fsrChannelsCard(title: "Sleeve B — FSR1…FSR5", reading: \.d2, exportBasename: "analysis-fsr-sleeve-b")
             }
             .padding()
+            .id("analysis-pair-\(wifiVM.analysisSelectedPairIndex)-\(wifiVM.analysisChartRows.count)")
         }
         .navigationTitle("Analysis")
+        .navigationBarTitleDisplayMode(.inline)
         .background(Color(.systemGroupedBackground))
+    }
+
+    private var analysisBatchControls: some View {
+        let pairs = wifiVM.analysisSelectablePairIndices
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("Analyze pair")
+                .font(.headline)
+
+            if pairs.isEmpty {
+                Text("Set pairs on Connect, record, then stop — then pick Pair 1, Pair 2, … here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                // Explicit buttons — more reliable than a segmented picker for switching.
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 8)], spacing: 8) {
+                    ForEach(pairs, id: \.self) { pair in
+                        let selected = wifiVM.analysisSelectedPairIndex == pair
+                        let samples = wifiVM.analysisSampleCount(forPair: pair)
+                        Button {
+                            wifiVM.selectAnalysisPair(pair)
+                        } label: {
+                            VStack(spacing: 2) {
+                                Text("Pair \(pair + 1)")
+                                    .font(.subheadline.weight(.semibold))
+                                Text(samples > 0 ? "\(samples) samples" : "No data")
+                                    .font(.caption2)
+                                    .foregroundStyle(selected ? Color.accentColor.opacity(0.9) : .secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .padding(.horizontal, 6)
+                            .background(selected ? Color.accentColor.opacity(0.18) : Color(.tertiarySystemFill))
+                            .foregroundStyle(selected ? Color.accentColor : Color.primary)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .strokeBorder(selected ? Color.accentColor : Color.clear, lineWidth: 1.5)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                HStack {
+                    Text(wifiVM.pairDisplayName(pairIndex: wifiVM.analysisSelectedPairIndex))
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    if wifiVM.analysisSampleCount(forPair: wifiVM.analysisSelectedPairIndex) == 0 {
+                        Text("This pair has no captured samples")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Text("Each pair is one person (Sleeve A + Sleeve B). Tap another pair to switch charts.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding()
+        .background(Color(.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
     private func presentChartExport(csv: String, basename: String) {
@@ -247,7 +313,7 @@ struct WiFiAnalysisView: View {
     }
 
     private func csvCombined() -> String {
-        var lines = ["sample_index,sum_fsr_d1,sum_fsr_d2"]
+        var lines = ["sample_index,sum_fsr_sleeve_a,sum_fsr_sleeve_b"]
         for row in plotRows {
             lines.append("\(row.sampleIndex),\(WiFiConnectViewModel.sumFSR(row.d1)),\(WiFiConnectViewModel.sumFSR(row.d2))")
         }
@@ -255,7 +321,7 @@ struct WiFiAnalysisView: View {
     }
 
     private func csvResultant() -> String {
-        var lines = ["tap_peak_sample_index,sum_fsr_d1,sum_fsr_d2,rms1,rms2,rms_ratio_d1_over_d2"]
+        var lines = ["tap_peak_sample_index,sum_fsr_sleeve_a,sum_fsr_sleeve_b,rms_a,rms_b,rms_ratio_a_over_b"]
         for e in tapPeakEvents {
             lines.append("\(e.peakSampleIndex),\(e.sumFsr1),\(e.sumFsr2),\(e.rms1),\(e.rms2),\(e.ratioD1OverD2)")
         }
@@ -300,13 +366,13 @@ struct WiFiAnalysisView: View {
                     x: .value("Sample", Double(row.sampleIndex)),
                     y: .value("Sum FSR", WiFiConnectViewModel.sumFSR(row.d1))
                 )
-                .foregroundStyle(by: .value("Device", "Device 1"))
+                .foregroundStyle(by: .value("Sleeve", "Sleeve A"))
                 .lineStyle(StrokeStyle(lineWidth: 1.25))
                 LineMark(
                     x: .value("Sample", Double(row.sampleIndex)),
                     y: .value("Sum FSR", WiFiConnectViewModel.sumFSR(row.d2))
                 )
-                .foregroundStyle(by: .value("Device", "Device 2"))
+                .foregroundStyle(by: .value("Sleeve", "Sleeve B"))
                 .lineStyle(StrokeStyle(lineWidth: 1.25))
             }
             ForEach(wifiVM.vibrationMarkers) { m in
@@ -324,7 +390,7 @@ struct WiFiAnalysisView: View {
                 }
             }
         }
-        .chartForegroundStyleScale(domain: ["Device 1", "Device 2"], range: [.blue, .orange])
+        .chartForegroundStyleScale(domain: ["Sleeve A", "Sleeve B"], range: [.blue, .orange])
         .chartLegend(position: .bottom, alignment: .center)
         .chartXAxis { AxisMarks(values: .automatic(desiredCount: 6)) }
         .chartYAxis { AxisMarks(values: .automatic(desiredCount: 4)) }
@@ -433,7 +499,7 @@ struct WiFiAnalysisView: View {
                 .font(.headline)
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Device 1")
+                    Text("Sleeve A")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text(peakText(wifiVM.peakD1))
@@ -441,7 +507,7 @@ struct WiFiAnalysisView: View {
                 }
                 Spacer()
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Device 2")
+                    Text("Sleeve B")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text(peakText(wifiVM.peakD2))

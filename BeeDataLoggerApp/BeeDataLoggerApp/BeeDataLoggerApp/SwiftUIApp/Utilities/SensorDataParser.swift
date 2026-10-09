@@ -35,8 +35,10 @@ enum SensorDataParser {
               let fsr3 = Int(parts[3]),
               let fsr4 = Int(parts[4]),
               let fsr5 = Int(parts[5]) else { return nil }
+        // Firmware sends epoch,fsr1..fsr6,battery_pct (8 cols) or the older
+        // epoch,fsr1..fsr5,battery_pct (7 cols). Battery is always the LAST column.
         let bat: Int?
-        if parts.count >= 7, let p = Int(parts[6]) {
+        if parts.count >= 7, let p = Int(parts[parts.count - 1]) {
             bat = min(100, max(0, p))
         } else {
             bat = nil

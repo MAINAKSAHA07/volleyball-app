@@ -44,15 +44,27 @@ final class WiFiDeviceConnection: ObservableObject {
     /// Full-rate latest sample (thread-safe). Used by the recording timer; UI uses throttled `lastReading`.
     private let latestSampleLock = NSLock()
     private var latestSample: SensorReading?
+    /// Wall-clock arrival time of `latestSample`. Auto-vibrate must reject stale samples: a device that
+    /// goes quiet after a real hit would otherwise keep reporting that peak and fire on zero signal.
+    private var latestSampleAt: CFTimeInterval = 0
 
     /// Max raw √(ΣFSR²) since last auto‑vibrate tick (same window as stream parse rate). Catches brief ball impacts missed by 20 Hz polling.
     private let peakAccumLock = NSLock()
     private var maxRawResultantAccum: Double = 0
 
-    /// Last N raw magnitudes (~80 ms at 500 Hz) so a 7‑8 sample tap still overlaps dual‑pad matching even if peaks aren’t on the same tick.
+    /// Whether TCP stream is ready for auto‑vibrate / vibrator commands (thread-safe; do not read `@Published state` off main).
+    private let streamReadyLock = NSLock()
+    private var streamReady = false
+
+    /// Recent raw magnitudes with arrival timestamps. Time-based (not sample-count based) so the window
+    /// covers the same real duration at every observed device rate (55 Hz … 500 Hz); a sample-count ring
+    /// silently shrinks to a few hundred ms on slow boards and drops brief ball impacts.
     private let rawRingLock = NSLock()
-    private var rawMagnitudeRing: [Double] = []
-    private let rawMagnitudeRingMax = 40
+    private var rawMagnitudeRing: [(mag: Double, at: CFTimeInterval)] = []
+    /// Hold peaks this long regardless of stream rate.
+    private let rawMagnitudeHoldSeconds: CFTimeInterval = 0.9
+    /// Memory bound only (0.9 s at 500 Hz ≈ 450 entries).
+    private let rawMagnitudeRingHardCap = 1200
 
     private var connection: NWConnection?
     private var buffer = Data()
@@ -84,11 +96,15 @@ final class WiFiDeviceConnection: ObservableObject {
         self.deviceIdentifier = deviceIdentifier
     }
 
-    /// Latest parsed reading at stream rate; safe to call from the recording queue.
-    func latestSampleForRecording() -> SensorReading? {
+    /// Latest parsed reading at stream rate, but only if it arrived within `maxAgeMs`.
+    /// Callers must always bound the age: an unbounded read of the last sample lets a sleeve that has
+    /// gone quiet keep presenting the peak from an earlier hit.
+    func latestSampleIfFresh(maxAgeMs: Double) -> SensorReading? {
         latestSampleLock.lock()
         defer { latestSampleLock.unlock() }
-        return latestSample
+        guard let sample = latestSample else { return nil }
+        guard CFAbsoluteTimeGetCurrent() - latestSampleAt < maxAgeMs / 1000.0 else { return nil }
+        return sample
     }
 
     /// Returns max raw resultant in the interval since the last call, then resets (one consumer: auto‑vibrate tick).
@@ -98,6 +114,19 @@ final class WiFiDeviceConnection: ObservableObject {
         maxRawResultantAccum = 0
         peakAccumLock.unlock()
         return v
+    }
+
+    /// Thread-safe stream readiness for auto‑vibrate and vibrator commands.
+    func isStreamReady() -> Bool {
+        streamReadyLock.lock()
+        defer { streamReadyLock.unlock() }
+        return streamReady
+    }
+
+    private func setStreamReady(_ ready: Bool) {
+        streamReadyLock.lock()
+        streamReady = ready
+        streamReadyLock.unlock()
     }
 
     private func resetPeakAccumulation() {
@@ -113,20 +142,34 @@ final class WiFiDeviceConnection: ObservableObject {
     }
 
     private func pushRawMagnitudeForAutoVibrate(_ mag: Double) {
+        let now = CFAbsoluteTimeGetCurrent()
         rawRingLock.lock()
-        rawMagnitudeRing.append(mag)
-        if rawMagnitudeRing.count > rawMagnitudeRingMax {
-            rawMagnitudeRing.removeFirst(rawMagnitudeRing.count - rawMagnitudeRingMax)
+        rawMagnitudeRing.append((mag: mag, at: now))
+        let cutoff = now - rawMagnitudeHoldSeconds
+        if let firstFresh = rawMagnitudeRing.firstIndex(where: { $0.at >= cutoff }) {
+            if firstFresh > 0 {
+                rawMagnitudeRing.removeFirst(firstFresh)
+            }
+        } else {
+            rawMagnitudeRing.removeAll(keepingCapacity: true)
+        }
+        if rawMagnitudeRing.count > rawMagnitudeRingHardCap {
+            rawMagnitudeRing.removeFirst(rawMagnitudeRing.count - rawMagnitudeRingHardCap)
         }
         rawRingLock.unlock()
     }
 
-    /// Max √(ΣFSR²) in the last ~40 samples (full stream rate). Used with auto‑vibrate so taps aren’t lost vs long presses.
+    /// Max √(ΣFSR²) within the last `rawMagnitudeHoldSeconds`, independent of stream rate.
+    /// Entries older than the window are ignored so a quiet sleeve reports 0 instead of an old peak.
     func maxRawMagnitudeInRollingWindow() -> Double {
+        let cutoff = CFAbsoluteTimeGetCurrent() - rawMagnitudeHoldSeconds
         rawRingLock.lock()
-        let v = rawMagnitudeRing.max() ?? 0
+        var maxFresh = 0.0
+        for entry in rawMagnitudeRing where entry.at >= cutoff {
+            maxFresh = max(maxFresh, entry.mag)
+        }
         rawRingLock.unlock()
-        return v
+        return maxFresh
     }
 
     func connect() {
@@ -138,6 +181,9 @@ final class WiFiDeviceConnection: ObservableObject {
         // Do not set `requiredInterfaceType = .wifi` — it breaks some hotspot / routed paths and causes flaky connects.
         let params = NWParameters.tcp
         params.includePeerToPeer = true
+        if let tcp = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcp.noDelay = true
+        }
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         scheduleConnectTimeout(seconds: 8)
@@ -147,6 +193,7 @@ final class WiFiDeviceConnection: ObservableObject {
             switch newState {
             case .ready:
                 self.cancelConnectTimeout()
+                self.setStreamReady(true)
                 self.setState(.connected)
                 self.clearBuffer()
                 self.resetPeakAccumulation()
@@ -155,10 +202,12 @@ final class WiFiDeviceConnection: ObservableObject {
                 self.armDataStallWatchdog()
             case .failed(let err):
                 self.cancelConnectTimeout()
+                self.setStreamReady(false)
                 self.setState(.failed(err.localizedDescription))
                 self.cleanup()
             case .cancelled:
                 self.cancelConnectTimeout()
+                self.setStreamReady(false)
                 self.setState(.disconnected)
                 self.cleanup()
             default:
@@ -184,9 +233,11 @@ final class WiFiDeviceConnection: ObservableObject {
         pendingFailureLine = nil
         latestSampleLock.lock()
         latestSample = nil
+        latestSampleAt = 0
         latestSampleLock.unlock()
         resetPeakAccumulation()
         resetRollingRawMagnitudes()
+        setStreamReady(false)
         DispatchQueue.main.async {
             self.lastReading = nil
             self.lastUpdated = nil
@@ -213,16 +264,16 @@ final class WiFiDeviceConnection: ObservableObject {
     /// Uses the connection’s serial queue so sends don’t race `receive` on the main thread.
     /// - Parameter pulseMilliseconds: 0 = firmware default pulse; 30…500 = pulse length in ms (firmware-clamped).
     func sendVibratorTest(pulseMilliseconds: UInt16 = 0) {
+        guard isStreamReady() else {
+            DispatchQueue.main.async { self.lastVibratorSendError = "Not connected" }
+            return
+        }
         guard let q = callbackQueue else {
             DispatchQueue.main.async { self.lastVibratorSendError = "No connection" }
             return
         }
         guard connection != nil else {
             DispatchQueue.main.async { self.lastVibratorSendError = "No connection" }
-            return
-        }
-        guard case .connected = state else {
-            DispatchQueue.main.async { self.lastVibratorSendError = "Not connected" }
             return
         }
         let payload: String
@@ -249,16 +300,16 @@ final class WiFiDeviceConnection: ObservableObject {
     /// Sends an arbitrary newline-terminated command to firmware over the same TCP stream.
     /// Firmware should ignore unknown commands and reply `OK ...` for ACKs.
     func sendControlCommand(_ commandLine: String) {
+        guard isStreamReady() else {
+            DispatchQueue.main.async { self.lastControlSendError = "Not connected" }
+            return
+        }
         guard let q = callbackQueue else {
             DispatchQueue.main.async { self.lastControlSendError = "No connection" }
             return
         }
         guard connection != nil else {
             DispatchQueue.main.async { self.lastControlSendError = "No connection" }
-            return
-        }
-        guard case .connected = state else {
-            DispatchQueue.main.async { self.lastControlSendError = "Not connected" }
             return
         }
         let payload = commandLine.hasSuffix("\n") ? commandLine : (commandLine + "\n")
@@ -363,6 +414,7 @@ final class WiFiDeviceConnection: ObservableObject {
                 peakAccumLock.unlock()
                 latestSampleLock.lock()
                 latestSample = reading
+                latestSampleAt = CFAbsoluteTimeGetCurrent()
                 latestSampleLock.unlock()
                 onParsedReading?(reading)
                 scheduleCoalescedReadingPublish(reading)
@@ -459,9 +511,11 @@ final class WiFiDeviceConnection: ObservableObject {
         lastReadingFlushTime = 0
         latestSampleLock.lock()
         latestSample = nil
+        latestSampleAt = 0
         latestSampleLock.unlock()
         resetPeakAccumulation()
         resetRollingRawMagnitudes()
+        setStreamReady(false)
         clearBuffer()
         connection?.cancel()
         connection = nil
@@ -522,18 +576,27 @@ final class WiFiStreamManager: ObservableObject {
 
     /// Device slots: 0..<(2*pairCount). Slot 0 = Pair1-A, 1 = Pair1-B, 2 = Pair2-A, ...
     @Published private(set) var devices: [WiFiDeviceConnection?] = Array(repeating: nil, count: maxDevices)
+    private var lockedDevices: [WiFiDeviceConnection?] = Array(repeating: nil, count: maxDevices)
+    private let devicesLock = NSLock()
 
     func device(at slot: Int) -> WiFiDeviceConnection? {
-        guard slot >= 0, slot < devices.count else { return nil }
-        return devices[slot]
+        devicesLock.lock()
+        defer { devicesLock.unlock() }
+        guard slot >= 0, slot < lockedDevices.count else { return nil }
+        return lockedDevices[slot]
     }
 
     private func replaceDevice(at slot: Int, with connection: WiFiDeviceConnection?) {
-        guard slot >= 0, slot < devices.count else { return }
-        var next = devices
-        next[slot]?.disconnect()
-        next[slot] = connection
-        devices = next
+        guard slot >= 0, slot < lockedDevices.count else { return }
+        devicesLock.lock()
+        let old = lockedDevices[slot]
+        lockedDevices[slot] = connection
+        let snapshot = lockedDevices
+        devicesLock.unlock()
+        old?.disconnect()
+        DispatchQueue.main.async {
+            self.devices = snapshot
+        }
     }
 
     func connectOne(endpoint: NWEndpoint, slot: Int) {
@@ -548,10 +611,16 @@ final class WiFiStreamManager: ObservableObject {
     }
 
     func disconnectAll() {
-        for i in 0..<devices.count {
-            devices[i]?.disconnect()
+        devicesLock.lock()
+        let copy = lockedDevices
+        lockedDevices = Array(repeating: nil, count: Self.maxDevices)
+        devicesLock.unlock()
+        for d in copy {
+            d?.disconnect()
         }
-        devices = Array(repeating: nil, count: Self.maxDevices)
+        DispatchQueue.main.async {
+            self.devices = Array(repeating: nil, count: Self.maxDevices)
+        }
     }
 }
 

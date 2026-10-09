@@ -37,8 +37,10 @@ final class WiFiConnectViewModel: ObservableObject {
     @Published var slotHosts: [String] = Array(repeating: "", count: WiFiStreamManager.maxDevices)
     /// Per-device slot Bonjour selections (DiscoveredWiFiDevice.key).
     @Published var slotSelectedKeys: [String] = Array(repeating: "", count: WiFiStreamManager.maxDevices)
-    /// Player wearing each sleeve (slot 0 = Pair1-A, …). Used as Excel tab names / export columns.
-    @Published var sleevePlayerNames: [String] = Array(repeating: "", count: WiFiStreamManager.maxDevices)
+    /// One person wears both sleeves in a pair — store a single display name per pair (Excel tab / Analysis page).
+    @Published var pairNames: [String] = Array(repeating: "", count: WiFiStreamManager.maxPairs)
+    private let pairNamesDefaultsKey = "pair_names_v1"
+    /// Legacy per-sleeve names (migrated into `pairNames` on load).
     private let sleevePlayerNamesDefaultsKey = "sleeve_player_names_v1"
 
     let discovery = BonjourDiscovery()
@@ -59,8 +61,10 @@ final class WiFiConnectViewModel: ObservableObject {
     @Published private(set) var lanScanState: LanScanState = .idle
     @Published private(set) var lanCandidates: [LanCandidate] = []
     @Published private(set) var localIPv4: String = ""
+    @Published private(set) var discoveryStatusMessage: String = "Discovery idle."
 
     private let lanScanner = LanPortScanner()
+    private var autoLanScanWorkItem: DispatchWorkItem?
 
     // MARK: - Recording
     @Published private(set) var isRecording: Bool = false
@@ -73,12 +77,20 @@ final class WiFiConnectViewModel: ObservableObject {
     private var recordedWideRowsByPair: [[WideSampleRow]] = []
     /// Live chart buffer during recording (active pair only, capped for memory).
     @Published private(set) var chartRows: [WideSampleRow] = []
-    /// Full-resolution copy of the last finished recording for Analysis (active pair).
+    /// Full-resolution copy of the last finished recording for Analysis (current analysis page).
     @Published private(set) var lastCompleteRecording: [WideSampleRow] = []
-    /// All pairs from the last stop (for multi-pair workbook export).
+    /// All pairs from the last stop (for multi-pair workbook export + batch Analysis).
     @Published private(set) var lastCompleteRecordingByPair: [[WideSampleRow]] = []
+    /// Peaks per pair from the last stop (mirrors `lastCompleteRecordingByPair`).
+    private var lastCompletePeaksByPair: [(PeakMetric?, PeakMetric?)] = []
+    /// Vibration markers per pair from the last stop (survives until next Record).
+    private var lastCompleteMarkersByPair: [Int: [VibrationChartMarker]] = [:]
     /// Shown on Dashboard after Stop — confirms capture / auto-save or explains empty sessions.
     @Published var lastSaveNotice: String?
+
+    // MARK: - Analysis pair selection (one person / pair at a time)
+    /// Which pair the Analysis tab is showing (0-based). Independent of Dashboard “active pair” after Stop.
+    @Published var analysisSelectedPairIndex: Int = 0
 
     // MARK: - Session archive (last 10, persisted)
     struct RecordingSession: Identifiable, Codable, Equatable {
@@ -128,6 +140,8 @@ final class WiFiConnectViewModel: ObservableObject {
     private let maxRowsPerPairHardCap = 400_000
     /// Flush counters / peaks / chart batch to Main at most this often while recording (~8 Hz).
     private let recordingUIMinInterval: CFTimeInterval = 0.125
+    /// Max rows handed to Main per flush. Recording keeps every row; only the live chart is thinned.
+    private let chartBatchFlushCap = 50
 
     /// Last known sample index per pair, updated off `recordingQueue` so the main-thread
     /// auto-vibrate tick never blocks on `recordingQueue.sync`.
@@ -177,10 +191,47 @@ final class WiFiConnectViewModel: ObservableObject {
         let d2: SensorReading
     }
 
-    /// Rows driving Analysis charts: after Stop, full `lastCompleteRecording`; while recording, live `chartRows` (also full-rate).
+    /// Rows driving Analysis charts: after Stop, full `lastCompleteRecording`; while recording, live `chartRows`.
     var analysisChartRows: [WideSampleRow] {
         if isRecording { return chartRows }
         return lastCompleteRecording.isEmpty ? chartRows : lastCompleteRecording
+    }
+
+    /// Pairs shown in the Analysis picker — every slot from the last capture (or configured pairs while recording).
+    var analysisSelectablePairIndices: [Int] {
+        if isRecording {
+            return Array(0..<pairCount)
+        }
+        if !lastCompleteRecordingByPair.isEmpty {
+            return Array(0..<lastCompleteRecordingByPair.count)
+        }
+        return Array(0..<pairCount)
+    }
+
+    /// Sample count for a pair in the last capture (0 if empty / unknown).
+    func analysisSampleCount(forPair pairIndex: Int) -> Int {
+        if isRecording, pairIndex == activePairIndex {
+            return chartRows.count
+        }
+        guard lastCompleteRecordingByPair.indices.contains(pairIndex) else { return 0 }
+        return lastCompleteRecordingByPair[pairIndex].count
+    }
+
+    /// Select which pair Analysis should show. Works for Pair 1, Pair 2, … after a multi-pair recording.
+    func selectAnalysisPair(_ pairIndex: Int) {
+        let allowed = analysisSelectablePairIndices
+        guard !allowed.isEmpty else { return }
+        let idx = allowed.contains(pairIndex) ? pairIndex : (allowed.first ?? 0)
+        analysisSelectedPairIndex = idx
+        if isRecording {
+            if idx != activePairIndex {
+                setActivePairIndex(idx)
+            } else {
+                syncActivePairRecordingUI()
+            }
+        } else {
+            loadAnalysisPairData(idx)
+        }
     }
 
     // MARK: - Auto vibrate when both devices’ resultants match
@@ -261,9 +312,55 @@ final class WiFiConnectViewModel: ObservableObject {
     private var vibrationMarkersSnapshotForExport: [VibrationChartMarker] = []
 
     private var autoVibrateCancellable: AnyCancellable?
+    private var autoVibrateTimer: DispatchSourceTimer?
     private var lastAutoVibrateFireTimeByPair: [Int: CFTimeInterval] = [:]
+    private let autoVibrateFireLock = NSLock()
+
+    private struct AutoVibrateTickConfig {
+        var enabled: Bool
+        var pairCount: Int
+        var minResultant01: Double
+        var weakPadFactor: Double
+        var ratioLower: Double
+        var ratioUpper: Double
+        var equalRatioLower: Double
+        var equalRatioUpper: Double
+        var intensity: Double
+    }
+
+    private var autoVibrateTickConfig = AutoVibrateTickConfig(
+        enabled: true,
+        pairCount: 1,
+        minResultant01: 0.06,
+        weakPadFactor: 0.40,
+        ratioLower: 0.8,
+        ratioUpper: 1.2,
+        equalRatioLower: 0.95,
+        equalRatioUpper: 1.05,
+        intensity: 0.45
+    )
+    private let autoVibrateConfigLock = NSLock()
+
+    private struct AutoVibrateFirePayload {
+        let pairIndex: Int
+        let ratio: Double
+        let sumMax: Double
+        let equalPressure: Bool
+        let sampleIndex: Int
+        let pulse: UInt16
+        let slotA: Int
+        let slotB: Int
+    }
     /// Auto‑vibrate poll: 0.04 s (~25 Hz). Rolling per‑device max (see WiFiDeviceConnection) does most of the work for taps.
     private let autoVibrateTickSeconds: TimeInterval = 0.04
+
+    /// A sleeve must have produced a sample this recently to take part in a match. Without this, a sleeve
+    /// that goes quiet after a real hit keeps presenting that old peak and fires vibrations on zero signal.
+    private let autoVibrateMaxSampleAgeMs: Double = 150
+
+    /// Both sleeves must exceed this RMS (raw ADU) before the ratio is considered. A near-zero pad paired
+    /// with another near-zero pad yields ratio ≈ 1.0, which otherwise looks like a perfectly balanced hit.
+    private let autoVibrateMinRmsFloor: Double = 100
 
     /// Pulse length 60…300 ms from intensity slider (ESP32 clamps to 30…500).
     func vibratorPulseMs() -> UInt16 {
@@ -318,10 +415,32 @@ final class WiFiConnectViewModel: ObservableObject {
         )
     }
 
-    private func vibrateCooldownSeconds() -> TimeInterval {
-        let t = min(1, max(0, autoVibrateIntensity))
+    private func vibrateCooldownSeconds(forIntensity intensity: Double) -> TimeInterval {
+        let t = min(1, max(0, intensity))
         // Shorter floor so repeated taps (ball contacts) aren’t swallowed as often as long‑press testing.
         return 0.09 - 0.05 * t
+    }
+
+    private func syncAutoVibrateTickConfig() {
+        autoVibrateConfigLock.lock()
+        autoVibrateTickConfig = AutoVibrateTickConfig(
+            enabled: autoVibrateOnMatchedResultant,
+            pairCount: pairCount,
+            minResultant01: autoVibrateMinResultant01,
+            weakPadFactor: weakPadFactor,
+            ratioLower: autoVibrateRatioLower,
+            ratioUpper: autoVibrateRatioUpper,
+            equalRatioLower: equalRatioBand.lowerBound,
+            equalRatioUpper: equalRatioBand.upperBound,
+            intensity: autoVibrateIntensity
+        )
+        autoVibrateConfigLock.unlock()
+    }
+
+    private func snapshotAutoVibrateTickConfig() -> AutoVibrateTickConfig {
+        autoVibrateConfigLock.lock()
+        defer { autoVibrateConfigLock.unlock() }
+        return autoVibrateTickConfig
     }
 
     /// Connection for a sleeve slot (0 = Pair1-A, 1 = Pair1-B, 2 = Pair2-A, …).
@@ -362,6 +481,12 @@ final class WiFiConnectViewModel: ObservableObject {
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] newState in
                     guard let self else { return }
+                    if case .connected = newState {
+                        // Arm on first device-ready, not on the connect tap: the tap can precede
+                        // the stream being live, which previously left auto-vibrate dormant
+                        // until the user tapped Connect a second time.
+                        self.ensureAutoVibrateTimerRunning()
+                    }
                     guard self.isRecording else { return }
                     switch newState {
                     case .disconnected, .failed:
@@ -383,9 +508,14 @@ final class WiFiConnectViewModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .assign(to: &$isBrowsing)
 
+        discovery.$statusMessage
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$discoveryStatusMessage)
+
         loadRecentSessions()
-        loadSleevePlayerNames()
+        loadPairNames()
         refreshActivePairDevices()
+        syncAutoVibrateTickConfig()
 
         manager.objectWillChange
             .receive(on: DispatchQueue.main)
@@ -393,6 +523,18 @@ final class WiFiConnectViewModel: ObservableObject {
                 self?.objectWillChange.send()
             }
             .store(in: &cancellables)
+
+        Publishers.CombineLatest4(
+            $autoVibrateOnMatchedResultant,
+            $autoVibrateMinResultant01,
+            $autoVibrateIntensity,
+            Publishers.CombineLatest($autoVibrateRatioLower, $autoVibrateRatioUpper)
+        )
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _, _, _, _ in
+            self?.syncAutoVibrateTickConfig()
+        }
+        .store(in: &cancellables)
     }
 
     /// Use from UI (Stepper/Picker) instead of writing `pairCount` directly — avoids broken `@Published` updates from `didSet`.
@@ -403,6 +545,7 @@ final class WiFiConnectViewModel: ObservableObject {
 
         let clamped = min(WiFiStreamManager.maxPairs, max(1, newValue))
         pairCount = clamped
+        syncAutoVibrateTickConfig()
         if activePairIndex >= pairCount {
             setActivePairIndex(pairCount - 1)
         } else {
@@ -424,6 +567,9 @@ final class WiFiConnectViewModel: ObservableObject {
         bindDeviceStateForwarding()
         if isRecording {
             syncActivePairRecordingUI()
+        } else if !lastCompleteRecordingByPair.isEmpty {
+            analysisSelectedPairIndex = idx
+            loadAnalysisPairData(idx)
         }
     }
 
@@ -505,40 +651,76 @@ final class WiFiConnectViewModel: ObservableObject {
         if slot == 1 { selected2Key = key }
     }
 
-    func setSleevePlayerName(_ name: String, slot: Int) {
-        guard slot >= 0, slot < sleevePlayerNames.count else { return }
-        var copy = sleevePlayerNames
-        copy[slot] = name
-        sleevePlayerNames = copy
-        persistSleevePlayerNames()
+    func setPairName(_ name: String, pairIndex: Int) {
+        guard pairIndex >= 0, pairIndex < pairNames.count else { return }
+        var copy = pairNames
+        copy[pairIndex] = name
+        pairNames = copy
+        persistPairNames()
     }
 
-    func sleevePlayerName(slot: Int) -> String {
-        guard slot >= 0, slot < sleevePlayerNames.count else { return "" }
-        return sleevePlayerNames[slot]
+    func pairName(pairIndex: Int) -> String {
+        guard pairIndex >= 0, pairIndex < pairNames.count else { return "" }
+        return pairNames[pairIndex]
     }
 
-    /// Excel worksheet tab title for a pair (from player names, else "Pair N").
+    /// User-facing pair label: custom person name, else "Pair N".
+    func pairDisplayName(pairIndex: Int) -> String {
+        let name = pairName(pairIndex: pairIndex).trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "Pair \(pairIndex + 1)" : name
+    }
+
+    /// Excel worksheet tab title for a pair (person name, else "Pair N").
     func pairSheetTitle(pairIndex: Int) -> String {
-        let a = sleevePlayerName(slot: pairIndex * 2).trimmingCharacters(in: .whitespacesAndNewlines)
-        let b = sleevePlayerName(slot: pairIndex * 2 + 1).trimmingCharacters(in: .whitespacesAndNewlines)
-        let title: String
-        if !a.isEmpty, !b.isEmpty { title = "\(a) vs \(b)" }
-        else if !a.isEmpty { title = a }
-        else if !b.isEmpty { title = b }
-        else { title = "Pair \(pairIndex + 1)" }
-        return RecordingWorkbookBuilder.sanitizeSheetName(title)
+        RecordingWorkbookBuilder.sanitizeSheetName(pairDisplayName(pairIndex: pairIndex))
     }
 
-    private func loadSleevePlayerNames() {
-        if let saved = UserDefaults.standard.stringArray(forKey: sleevePlayerNamesDefaultsKey),
-           saved.count == WiFiStreamManager.maxDevices {
-            sleevePlayerNames = saved
+    private func loadPairNames() {
+        if let saved = UserDefaults.standard.stringArray(forKey: pairNamesDefaultsKey),
+           saved.count == WiFiStreamManager.maxPairs {
+            pairNames = saved
+            return
+        }
+        // Migrate legacy per-sleeve player names → one name per pair (prefer Sleeve A, else B).
+        if let legacy = UserDefaults.standard.stringArray(forKey: sleevePlayerNamesDefaultsKey),
+           legacy.count == WiFiStreamManager.maxDevices {
+            var migrated = Array(repeating: "", count: WiFiStreamManager.maxPairs)
+            for pair in 0..<WiFiStreamManager.maxPairs {
+                let a = legacy[pair * 2].trimmingCharacters(in: .whitespacesAndNewlines)
+                let b = legacy[pair * 2 + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+                migrated[pair] = !a.isEmpty ? a : b
+            }
+            pairNames = migrated
+            persistPairNames()
         }
     }
 
-    private func persistSleevePlayerNames() {
-        UserDefaults.standard.set(sleevePlayerNames, forKey: sleevePlayerNamesDefaultsKey)
+    private func persistPairNames() {
+        UserDefaults.standard.set(pairNames, forKey: pairNamesDefaultsKey)
+    }
+
+    // MARK: - Analysis pair loading
+
+    private func loadAnalysisPairData(_ pairIndex: Int) {
+        guard lastCompleteRecordingByPair.indices.contains(pairIndex) else {
+            lastCompleteRecording = []
+            vibrationMarkers = []
+            peakD1 = nil
+            peakD2 = nil
+            return
+        }
+        lastCompleteRecording = lastCompleteRecordingByPair[pairIndex]
+        vibrationMarkers = lastCompleteMarkersByPair[pairIndex]
+            ?? vibrationMarkersByPair[pairIndex]
+            ?? []
+        if lastCompletePeaksByPair.indices.contains(pairIndex) {
+            peakD1 = lastCompletePeaksByPair[pairIndex].0
+            peakD2 = lastCompletePeaksByPair[pairIndex].1
+        } else {
+            let peaks = Self.peaksFromRows(lastCompleteRecording)
+            peakD1 = peaks.0
+            peakD2 = peaks.1
+        }
     }
 
     private func refreshActivePairDevices() {
@@ -603,10 +785,26 @@ final class WiFiConnectViewModel: ObservableObject {
 
     func startDiscovery() {
         discovery.start()
+        scheduleAutoLanScanFallback()
     }
 
     func stopDiscovery() {
+        autoLanScanWorkItem?.cancel()
+        autoLanScanWorkItem = nil
         discovery.stop()
+    }
+
+    /// Bonjour is often blocked on Mac until Local Network permission is granted — scan TCP port 3333 as fallback.
+    private func scheduleAutoLanScanFallback() {
+        autoLanScanWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.discovered.isEmpty else { return }
+            if case .scanning = self.lanScanState { return }
+            self.scanLANForServers()
+        }
+        autoLanScanWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
     }
 
     func connect() {
@@ -669,6 +867,7 @@ final class WiFiConnectViewModel: ObservableObject {
 
         refreshActivePairDevices()
         bindDeviceStateForwarding()
+        syncAutoVibrateTickConfig()
         installAutoVibrateTimer()
         objectWillChange.send()
     }
@@ -676,18 +875,21 @@ final class WiFiConnectViewModel: ObservableObject {
     // Start TCP port scan on the local subnet to find stream servers on port 3333.
     // This is faster than guessing IPs, and works even when Bonjour is failing.
     func scanLANForServers() {
+        autoLanScanWorkItem?.cancel()
+        autoLanScanWorkItem = nil
         lanCandidates = []
         lanScanState = .scanning
 
-        guard let info = lanScanner.currentIPv4Info() else {
-            lanScanState = .failed("Could not determine local IPv4 subnet")
+        let subnets = lanScanner.allIPv4ScanInfos()
+        guard !subnets.isEmpty else {
+            lanScanState = .failed("No local Wi‑Fi/Ethernet interface found. On Mac: System Settings → Network — confirm you are on the same network as the ESP32 boards.")
             return
         }
-        localIPv4 = info.localIP
+        localIPv4 = subnets.map { "\($0.interfaceName): \($0.localIP)/\($0.prefixLen)" }.joined(separator: " · ")
 
         lanScanner.scanTCPPort(
             port: UInt16(port) ?? 3333,
-            timeout: 0.25,
+            timeout: 0.35,
             concurrency: 28,
             onCandidate: { [weak self] candidate in
                 guard let self else { return }
@@ -722,6 +924,9 @@ final class WiFiConnectViewModel: ObservableObject {
     func disconnectAll() {
         stopRecordingInternal()
         removeAutoVibrateTimer()
+        autoVibrateFireLock.lock()
+        lastAutoVibrateFireTimeByPair = [:]
+        autoVibrateFireLock.unlock()
         deviceStateSubscriptions.removeAll()
         vibrationMarkers = []
         vibrationMarkersByPair = [:]
@@ -731,37 +936,58 @@ final class WiFiConnectViewModel: ObservableObject {
         device2 = nil
     }
 
+    /// Installs the auto-vibrate timer only if it is not already running (safe to call on every
+    /// device `.connected` transition).
+    private func ensureAutoVibrateTimerRunning() {
+        guard autoVibrateTimer == nil else {
+            syncAutoVibrateTickConfig()
+            return
+        }
+        installAutoVibrateTimer()
+    }
+
     private func installAutoVibrateTimer() {
         removeAutoVibrateTimer()
-        // Use `.common` so hits aren’t missed while scrolling; tick is light (envelope + compare only).
-        autoVibrateCancellable = Timer.publish(every: autoVibrateTickSeconds, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                self?.tickAutoVibrateFromMatchedResultant()
+        syncAutoVibrateTickConfig()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "com.beedatalogger.autovib", qos: .userInteractive))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(Int(autoVibrateTickSeconds * 1000)))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let config = self.snapshotAutoVibrateTickConfig()
+            guard config.enabled else { return }
+            for pair in 0 ..< config.pairCount {
+                if let payload = self.evaluateAutoVibrateForPair(pair, config: config) {
+                    DispatchQueue.main.async {
+                        self.applyAutoVibrateFire(payload)
+                    }
+                }
             }
+        }
+        timer.resume()
+        autoVibrateTimer = timer
     }
 
     private func removeAutoVibrateTimer() {
+        autoVibrateTimer?.cancel()
+        autoVibrateTimer = nil
         autoVibrateCancellable?.cancel()
         autoVibrateCancellable = nil
     }
 
-    private func tickAutoVibrateFromMatchedResultant() {
-        guard autoVibrateOnMatchedResultant else { return }
-        for pair in 0 ..< pairCount {
-            tickAutoVibrateForPair(pair)
-        }
-    }
-
-    private func tickAutoVibrateForPair(_ pairIndex: Int) {
+    private func evaluateAutoVibrateForPair(_ pairIndex: Int, config: AutoVibrateTickConfig) -> AutoVibrateFirePayload? {
         let aSlot = pairIndex * 2
         let bSlot = aSlot + 1
-        guard let d1 = device(atSlot: aSlot), let d2 = device(atSlot: bSlot) else { return }
-        guard case .connected = d1.state, case .connected = d2.state else { return }
-        guard let s1 = d1.latestSampleForRecording(), let s2 = d2.latestSampleForRecording() else { return }
-
+        guard let d1 = device(atSlot: aSlot), let d2 = device(atSlot: bSlot) else { return nil }
+        guard d1.isStreamReady(), d2.isStreamReady() else { return nil }
+        // Drain interval peaks on every tick, including ticks where one sleeve is stale. Otherwise
+        // a peak accumulated immediately before a stream pause survives and is reused after recovery.
         let peakRaw1 = d1.consumePeakRawResultantSinceLastTick()
         let peakRaw2 = d2.consumePeakRawResultantSinceLastTick()
+        // Both sleeves must be actively streaming right now — a stale sample from an earlier hit
+        // would otherwise keep matching long after the pad went quiet.
+        guard let s1 = d1.latestSampleIfFresh(maxAgeMs: autoVibrateMaxSampleAgeMs),
+              let s2 = d2.latestSampleIfFresh(maxAgeMs: autoVibrateMaxSampleAgeMs) else { return nil }
+
         let roll1 = d1.maxRawMagnitudeInRollingWindow()
         let roll2 = d2.maxRawMagnitudeInRollingWindow()
         let raw1 = max(s1.resultantMagnitude, peakRaw1, roll1)
@@ -771,46 +997,71 @@ final class WiFiConnectViewModel: ObservableObject {
         let n2 = Self.normalizedRawResultant01(rawResultant: raw2)
         let hiN = max(n1, n2)
         let loN = min(n1, n2)
-        guard hiN > 0, loN > 0 else { return }
+        guard hiN > 0, loN > 0 else { return nil }
 
-        let minHi = autoVibrateMinResultant01
-        let minLo = autoVibrateMinResultant01 * weakPadFactor
-        guard hiN >= minHi, loN >= minLo else { return }
+        let minHi = config.minResultant01
+        let minLo = config.minResultant01 * config.weakPadFactor
+        guard hiN >= minHi, loN >= minLo else { return nil }
 
-        let eps = 1e-6
         let rmsDiv = Double(SensorReading.fsrChannelCount).squareRoot()
         let rms1 = raw1 / rmsDiv
         let rms2 = raw2 / rmsDiv
-        guard rms1 > eps, rms2 > eps else { return }
+        // Hard floor on BOTH sleeves: two near-zero pads produce ratio ≈ 1.0 and look "balanced".
+        guard rms1 > autoVibrateMinRmsFloor, rms2 > autoVibrateMinRmsFloor else { return nil }
         let ratio = rms1 / rms2
-        let ratioBand = autoVibrateRatioLower...autoVibrateRatioUpper
-        guard ratioBand.contains(ratio) else { return }
-        let equalPressure = equalRatioBand.contains(ratio)
+        let ratioBand = config.ratioLower...config.ratioUpper
+        guard ratioBand.contains(ratio) else { return nil }
+        let equalPressure = (config.equalRatioLower...config.equalRatioUpper).contains(ratio)
 
         let now = CFAbsoluteTimeGetCurrent()
+        autoVibrateFireLock.lock()
         let lastFire = lastAutoVibrateFireTimeByPair[pairIndex] ?? 0
-        guard now - lastFire >= vibrateCooldownSeconds() else { return }
+        let cooldown = vibrateCooldownSeconds(forIntensity: config.intensity)
+        guard now - lastFire >= cooldown else {
+            autoVibrateFireLock.unlock()
+            return nil
+        }
         lastAutoVibrateFireTimeByPair[pairIndex] = now
-        lastAutoVibrateEventAt = Date()
+        autoVibrateFireLock.unlock()
 
         let sumMax = max(Self.sumFSR(s1), Self.sumFSR(s2))
+        let sampleIndex = latestPairedSampleIndexForVibrationMarker(pairIndex: pairIndex)
+        let pulse = {
+            let t = min(1, max(0, config.intensity))
+            let ms = 60 + (300 - 60) * t
+            return UInt16(ms)
+        }()
+
+        return AutoVibrateFirePayload(
+            pairIndex: pairIndex,
+            ratio: ratio,
+            sumMax: sumMax,
+            equalPressure: equalPressure,
+            sampleIndex: sampleIndex,
+            pulse: pulse,
+            slotA: aSlot,
+            slotB: bSlot
+        )
+    }
+
+    private func applyAutoVibrateFire(_ payload: AutoVibrateFirePayload) {
+        lastAutoVibrateEventAt = Date()
         if isRecording {
-            let idx = latestPairedSampleIndexForVibrationMarker(pairIndex: pairIndex)
-            let marker = VibrationChartMarker(
-                id: UUID(),
-                kind: .auto,
-                pairIndex: pairIndex,
-                sampleIndex: idx,
-                manualSleeveSide: nil,
-                rmsRatioD1OverD2: ratio,
-                sumFSRMax: sumMax,
-                isEqualPressure: equalPressure
+            appendVibrationMarker(
+                VibrationChartMarker(
+                    id: UUID(),
+                    kind: .auto,
+                    pairIndex: payload.pairIndex,
+                    sampleIndex: payload.sampleIndex,
+                    manualSleeveSide: nil,
+                    rmsRatioD1OverD2: payload.ratio,
+                    sumFSRMax: payload.sumMax,
+                    isEqualPressure: payload.equalPressure
+                )
             )
-            appendVibrationMarker(marker)
         }
-        let pulse = vibratorPulseMs()
-        d1.sendVibratorTest(pulseMilliseconds: pulse)
-        d2.sendVibratorTest(pulseMilliseconds: pulse)
+        device(atSlot: payload.slotA)?.sendVibratorTest(pulseMilliseconds: payload.pulse)
+        device(atSlot: payload.slotB)?.sendVibratorTest(pulseMilliseconds: payload.pulse)
     }
 
     func startRecording() {
@@ -834,10 +1085,15 @@ final class WiFiConnectViewModel: ObservableObject {
         vibrationMarkers = []
         vibrationMarkersByPair = [:]
         vibrationMarkersSnapshotForExport = []
-        lastAutoVibrateFireTimeByPair = [:]
+        autoVibrateFireLock.lock()
+        lastAutoVibrateFireTimeByPair.removeAll()
+        autoVibrateFireLock.unlock()
         chartRows.removeAll(keepingCapacity: true)
         lastCompleteRecording = []
         lastCompleteRecordingByPair = []
+        lastCompletePeaksByPair = []
+        lastCompleteMarkersByPair = [:]
+        analysisSelectedPairIndex = 0
         peakD1 = nil
         peakD2 = nil
         recordedCount = 0
@@ -860,9 +1116,22 @@ final class WiFiConnectViewModel: ObservableObject {
         stopRecordingInternal()
 
         lastCompleteRecordingByPair = rowsByPair
+        lastCompleteMarkersByPair = vibrationMarkersByPair
         vibrationMarkersSnapshotForExport = vibrationMarkersByPair.values.flatMap { $0 }
-        let activeRows = rowsByPair.indices.contains(activePairIndex) ? rowsByPair[activePairIndex] : []
-        lastCompleteRecording = activeRows
+
+        // Snapshot peaks per pair (recording state was cleared — recompute from captured rows).
+        lastCompletePeaksByPair = rowsByPair.map { Self.peaksFromRows($0) }
+
+        // Open Analysis on the active pair when it has data; otherwise first pair with rows.
+        let preferred = activePairIndex
+        if rowsByPair.indices.contains(preferred), !rowsByPair[preferred].isEmpty {
+            analysisSelectedPairIndex = preferred
+        } else if let firstWithData = rowsByPair.firstIndex(where: { !$0.isEmpty }) {
+            analysisSelectedPairIndex = firstWithData
+        } else {
+            analysisSelectedPairIndex = 0
+        }
+        loadAnalysisPairData(analysisSelectedPairIndex)
 
         let totalRows = rowsByPair.reduce(0) { $0 + $1.count }
         let startedAt = activeSessionStartedAt ?? stoppedAt
@@ -1047,13 +1316,18 @@ final class WiFiConnectViewModel: ObservableObject {
                 push(&st.q2, head: &st.q2Head, r: reading)
             }
 
-            // Establish epoch offset once we have at least one reading from both.
+            // Establish the D2−D1 clock offset before the first pairing attempt below. Boards NTP-sync
+            // at boot but drift apart immediately (observed from +11 ms to ±1041 ms); without this the
+            // 6 ms pairing window can never match, so every row would be dropped.
+            // Use receive time to remove the gap between the two first packets. Subtracting device
+            // epochs alone confuses "D2 connected 800 ms later" with an 800 ms clock offset.
             if st.epochOffsetD2MinusD1 == nil,
-               st.q1.count > st.q1Head,
-               st.q2.count > st.q2Head {
-                let d1e = st.q1[st.q1Head].epochMs
-                let d2e = st.q2[st.q2Head].epochMs
-                st.epochOffsetD2MinusD1 = d2e - d1e
+               let newestD1 = st.q1.last,
+               let newestD2 = st.q2.last {
+                let receiveDeltaMs = Int64(
+                    (newestD2.receivedAt.timeIntervalSince(newestD1.receivedAt) * 1000.0).rounded()
+                )
+                st.epochOffsetD2MinusD1 = newestD2.epochMs - newestD1.epochMs - receiveDeltaMs
             }
 
             let offset = st.epochOffsetD2MinusD1 ?? 0
@@ -1136,13 +1410,14 @@ final class WiFiConnectViewModel: ObservableObject {
         let totalCnt = totalRecordedRowCount()
         let pCopy1 = st.peak1
         let pCopy2 = st.peak2
-        let batch = st.chartBatch
+        // Cap what crosses to Main: with several pairs flushing at ~8 Hz each, an uncapped batch
+        // grows under load and stutters the UI. The live chart only needs the most recent window.
+        let batch = Array(st.chartBatch.suffix(chartBatchFlushCap))
         st.chartBatch.removeAll(keepingCapacity: true)
-        let isActive = pairIndex == activePairIndex
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.recordedCount = totalCnt
-            guard isActive else { return }
+            guard pairIndex == self.activePairIndex else { return }
             self.peakD1 = pCopy1
             self.peakD2 = pCopy2
             if !batch.isEmpty {
@@ -1190,7 +1465,7 @@ final class WiFiConnectViewModel: ObservableObject {
     }
 
     private static let pairExportHeader: [String] = [
-        "sample_index", "recorded_at_iso", "sleeve_a_player", "sleeve_b_player",
+        "sample_index", "recorded_at_iso", "pair_name",
         "d1_epoch_ms", "d1_fsr1", "d1_fsr2", "d1_fsr3", "d1_fsr4", "d1_fsr5", "d1_bat_pct",
         "d2_epoch_ms", "d2_fsr1", "d2_fsr2", "d2_fsr3", "d2_fsr4", "d2_fsr5", "d2_bat_pct",
         "auto_vibrate_events_this_sample", "auto_vibrate_events_cumulative",
@@ -1222,8 +1497,7 @@ final class WiFiConnectViewModel: ObservableObject {
         rows: [WideSampleRow],
         vibrationMarkers markers: [VibrationChartMarker]
     ) -> [[String]] {
-        let playerA = sleevePlayerName(slot: pairIndex * 2)
-        let playerB = sleevePlayerName(slot: pairIndex * 2 + 1)
+        let personName = pairDisplayName(pairIndex: pairIndex)
         var table: [[String]] = []
         table.reserveCapacity(rows.count + 1)
         table.append(Self.pairExportHeader)
@@ -1249,8 +1523,7 @@ final class WiFiConnectViewModel: ObservableObject {
             table.append([
                 String(r.sampleIndex),
                 iso.string(from: r.recordedAt),
-                playerA,
-                playerB,
+                personName,
                 String(d1.epochMs),
                 String(d1.fsr1), String(d1.fsr2), String(d1.fsr3), String(d1.fsr4), String(d1.fsr5),
                 d1.batteryPercent.map(String.init) ?? "",
@@ -1264,6 +1537,32 @@ final class WiFiConnectViewModel: ObservableObject {
             ])
         }
         return table
+    }
+
+    /// Recompute peaks for Analysis page switching after Stop (recording state is already cleared).
+    private static func peaksFromRows(_ rows: [WideSampleRow]) -> (PeakMetric?, PeakMetric?) {
+        guard !rows.isEmpty else { return (nil, nil) }
+        var p1: PeakMetric?
+        var p2: PeakMetric?
+        for r in rows {
+            let res1 = r.d1.resultantMagnitude
+            let res2 = r.d2.resultantMagnitude
+            if let cur = p1 {
+                if res1 > cur.maxResultant {
+                    p1 = PeakMetric(maxResultant: res1, atEpochMs: r.d1.epochMs, atSampleIndex: r.sampleIndex)
+                }
+            } else {
+                p1 = PeakMetric(maxResultant: res1, atEpochMs: r.d1.epochMs, atSampleIndex: r.sampleIndex)
+            }
+            if let cur = p2 {
+                if res2 > cur.maxResultant {
+                    p2 = PeakMetric(maxResultant: res2, atEpochMs: r.d2.epochMs, atSampleIndex: r.sampleIndex)
+                }
+            } else {
+                p2 = PeakMetric(maxResultant: res2, atEpochMs: r.d2.epochMs, atSampleIndex: r.sampleIndex)
+            }
+        }
+        return (p1, p2)
     }
 
     /// Single-pair CSV (legacy export shape); prefer `makeMultiPairWideCSV`.
